@@ -4,13 +4,16 @@ This file holds everything the trained policy needs, shared by training and depl
 
 * ``features``: observation -> feature vector. Written once for numpy *and* jax (``xp``), so the
   training environment and the controller see exactly the same inputs.
-* ``Agent``: actor-critic MLP with a built-in running observation normaliser.
+* ``Agent``: actor-critic MLP with a built-in running observation normaliser (training only).
 * ``scale_action``: network output in [-1, 1] -> ``[roll, pitch, yaw, collective thrust]``.
-* ``RaceRL``: the controller (loads ``race_rl.ckpt`` from this directory).
+* ``policy``: the deterministic actor evaluated with numpy, weights from ``race_rl.npz``.
+* ``RaceRL``: the controller. It needs numpy only, because the default pixi environment used by
+  ``pixi run evaluate`` (and the online competition) does not contain torch.
 
 Train with ``python lsy_drone_racing/control/train_race_rl.py`` (needs the gpu pixi env), copy the
-resulting ``race_rl.ckpt`` next to this file, set ``control_mode = "attitude"`` and
-``controller.file = "race_rl.py"`` in ``level2.toml``.
+resulting ``race_rl.ckpt`` next to this file and convert it once with an environment that has torch:
+``pixi run -e tests python -c "from lsy_drone_racing.control.race_rl import export_npz; export_npz()"``.
+Then set ``control_mode = "attitude"`` and ``controller.file = "race_rl.py"`` in ``level2.toml``.
 """
 
 from __future__ import annotations
@@ -19,12 +22,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
-import torch.nn as nn
 from crazyflow.dynamics import load_params
-from torch.distributions.normal import Normal
 
 from lsy_drone_racing.control import Controller
+
+try:  # Only needed for training and for exporting the checkpoint
+    import torch
+    import torch.nn as nn
+    from torch.distributions.normal import Normal
+except ImportError:
+    torch = None
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -35,6 +42,7 @@ N_PASSES = 5
 RP_MAX = 1.2  # rad, roll/pitch command at network output +-1
 OBS_DIM = 59
 CKPT = Path(__file__).parent / "race_rl.ckpt"
+NPZ = Path(__file__).parent / "race_rl.npz"  # Actor weights and normaliser, exported from CKPT
 
 
 # --------------------------------------------------------------------------------------------------
@@ -122,69 +130,86 @@ def scale_action(a, t_min: float, t_max: float, xp):
 # --------------------------------------------------------------------------------------------------
 # Agent
 # --------------------------------------------------------------------------------------------------
-def layer_init(layer: nn.Module, std: float = np.sqrt(2), bias: float = 0.0) -> nn.Module:
-    """Orthogonal initialisation."""
-    nn.init.orthogonal_(layer.weight, std)
-    nn.init.constant_(layer.bias, bias)
-    return layer
+if torch is not None:  # Training only; the controller below runs on numpy alone
+    def layer_init(layer: nn.Module, std: float = np.sqrt(2), bias: float = 0.0) -> nn.Module:
+        """Orthogonal initialisation."""
+        nn.init.orthogonal_(layer.weight, std)
+        nn.init.constant_(layer.bias, bias)
+        return layer
 
 
-class Agent(nn.Module):
-    """Actor-critic with running observation normalisation (stored in the checkpoint)."""
+    class Agent(nn.Module):
+        """Actor-critic with running observation normalisation (stored in the checkpoint)."""
 
-    def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = 4, hidden: int = 128):
-        """Create the networks."""
-        super().__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, hidden)),
-            nn.Tanh(),
-            layer_init(nn.Linear(hidden, hidden)),
-            nn.Tanh(),
-            layer_init(nn.Linear(hidden, 1), std=1.0),
-        )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, hidden)),
-            nn.Tanh(),
-            layer_init(nn.Linear(hidden, hidden)),
-            nn.Tanh(),
-            layer_init(nn.Linear(hidden, act_dim), std=0.01),
-            nn.Tanh(),
-        )
-        self.actor_logstd = nn.Parameter(torch.full((1, act_dim), -0.5))
-        self.register_buffer("obs_mean", torch.zeros(obs_dim))
-        self.register_buffer("obs_var", torch.ones(obs_dim))
-        self.register_buffer("obs_count", torch.tensor(1e-4))
+        def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = 4, hidden: int = 128):
+            """Create the networks."""
+            super().__init__()
+            self.critic = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, hidden)),
+                nn.Tanh(),
+                layer_init(nn.Linear(hidden, hidden)),
+                nn.Tanh(),
+                layer_init(nn.Linear(hidden, 1), std=1.0),
+            )
+            self.actor_mean = nn.Sequential(
+                layer_init(nn.Linear(obs_dim, hidden)),
+                nn.Tanh(),
+                layer_init(nn.Linear(hidden, hidden)),
+                nn.Tanh(),
+                layer_init(nn.Linear(hidden, act_dim), std=0.01),
+                nn.Tanh(),
+            )
+            self.actor_logstd = nn.Parameter(torch.full((1, act_dim), -0.5))
+            self.register_buffer("obs_mean", torch.zeros(obs_dim))
+            self.register_buffer("obs_var", torch.ones(obs_dim))
+            self.register_buffer("obs_count", torch.tensor(1e-4))
 
-    def norm(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalise observations."""
-        return torch.clamp((x - self.obs_mean) / torch.sqrt(self.obs_var + 1e-8), -10.0, 10.0)
+        def norm(self, x: torch.Tensor) -> torch.Tensor:
+            """Normalise observations."""
+            return torch.clamp((x - self.obs_mean) / torch.sqrt(self.obs_var + 1e-8), -10.0, 10.0)
 
-    @torch.no_grad()
-    def update_norm(self, x: torch.Tensor) -> None:
-        """Update the running mean/variance with a batch (B, obs_dim)."""
-        b_mean, b_var, b_n = x.mean(0), x.var(0, unbiased=False), float(x.shape[0])
-        delta = b_mean - self.obs_mean
-        tot = self.obs_count + b_n
-        self.obs_mean += delta * b_n / tot
-        m2 = self.obs_var * self.obs_count + b_var * b_n + delta**2 * self.obs_count * b_n / tot
-        self.obs_var.copy_(m2 / tot)
-        self.obs_count.copy_(tot)
+        @torch.no_grad()
+        def update_norm(self, x: torch.Tensor) -> None:
+            """Update the running mean/variance with a batch (B, obs_dim)."""
+            b_mean, b_var, b_n = x.mean(0), x.var(0, unbiased=False), float(x.shape[0])
+            delta = b_mean - self.obs_mean
+            tot = self.obs_count + b_n
+            self.obs_mean += delta * b_n / tot
+            m2 = self.obs_var * self.obs_count + b_var * b_n + delta**2 * self.obs_count * b_n / tot
+            self.obs_var.copy_(m2 / tot)
+            self.obs_count.copy_(tot)
 
-    def get_value(self, x: torch.Tensor) -> torch.Tensor:
-        """State value."""
-        return self.critic(self.norm(x))
+        def get_value(self, x: torch.Tensor) -> torch.Tensor:
+            """State value."""
+            return self.critic(self.norm(x))
 
-    def get_action_and_value(
-        self, x: torch.Tensor, action: torch.Tensor | None = None, deterministic: bool = False
-    ):
-        """Sample (or evaluate) an action; returns action, logprob, entropy, value."""
-        xn = self.norm(x)
-        mean = self.actor_mean(xn)
-        std = torch.exp(self.actor_logstd.expand_as(mean))
-        dist = Normal(mean, std)
-        if action is None:
-            action = mean if deterministic else dist.sample()
-        return action, dist.log_prob(action).sum(1), dist.entropy().sum(1), self.critic(xn)
+        def get_action_and_value(
+            self, x: torch.Tensor, action: torch.Tensor | None = None, deterministic: bool = False
+        ):
+            """Sample (or evaluate) an action; returns action, logprob, entropy, value."""
+            xn = self.norm(x)
+            mean = self.actor_mean(xn)
+            std = torch.exp(self.actor_logstd.expand_as(mean))
+            dist = Normal(mean, std)
+            if action is None:
+                action = mean if deterministic else dist.sample()
+            return action, dist.log_prob(action).sum(1), dist.entropy().sum(1), self.critic(xn)
+
+
+def export_npz(ckpt: Path = CKPT, out: Path = NPZ) -> None:
+    """Store the actor weights and the observation normaliser of a checkpoint for numpy inference."""
+    sd = torch.load(ckpt, map_location="cpu")
+    keys = ["obs_mean", "obs_var"]
+    keys += [f"actor_mean.{i}.{p}" for i in (0, 2, 4) for p in ("weight", "bias")]
+    np.savez(out, **{k.replace(".", "_"): sd[k].numpy() for k in keys})
+
+
+def policy(x: NDArray, w: dict[str, NDArray]) -> NDArray:
+    """Deterministic action (B, 4) of the actor for features (B, OBS_DIM), same as ``Agent``."""
+    x = np.clip((x - w["obs_mean"]) / np.sqrt(w["obs_var"] + 1e-8), -10.0, 10.0)
+    h = np.tanh(x @ w["actor_mean_0_weight"].T + w["actor_mean_0_bias"])
+    h = np.tanh(h @ w["actor_mean_2_weight"].T + w["actor_mean_2_bias"])
+    return np.tanh(h @ w["actor_mean_4_weight"].T + w["actor_mean_4_bias"])
 
 
 # --------------------------------------------------------------------------------------------------
@@ -198,9 +223,8 @@ class RaceRL(Controller):
         super().__init__(obs, info, config)
         params = load_params(config.sim.dynamics, config.sim.drone)
         self._t_min, self._t_max = float(params["thrust_min"]) * 4, float(params["thrust_max"]) * 4
-        self._agent = Agent()
-        self._agent.load_state_dict(torch.load(CKPT, map_location="cpu"))
-        self._agent.eval()
+        with np.load(NPZ) as f:
+            self._w = {k: f[k] for k in f.files}
         self._last = np.zeros((1, 4), dtype=np.float32)
 
     def compute_control(self, obs: dict, info: dict | None = None) -> NDArray[np.floating]:
@@ -208,9 +232,7 @@ class RaceRL(Controller):
         batched = {k: np.asarray(v)[None] for k, v in obs.items()}
         batched["pos"] = batched["pos"].astype(np.float32)
         x = features(batched, self._last, np)
-        with torch.no_grad():
-            a, _, _, _ = self._agent.get_action_and_value(torch.from_numpy(x), deterministic=True)
-        a = a.numpy().astype(np.float32)
+        a = policy(x, self._w).astype(np.float32)
         self._last = a.copy()
         return scale_action(a, self._t_min, self._t_max, np)[0].astype(np.float32)
 
