@@ -1,4 +1,4 @@
-"""Racing policy (PPO) for level 2 + deployment controller. Interface: ``control_mode = "attitude"``.
+"""Racing policy (PPO) for level 2 + deployment controller (``control_mode = "attitude"``).
 
 This file holds everything the trained policy needs, shared by training and deployment:
 
@@ -23,13 +23,14 @@ import pickle
 import zipfile
 from collections import OrderedDict
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from crazyflow.dynamics import load_params
+
 from lsy_drone_racing.control import Controller
 
-try:  # Only needed for training and for exporting the checkpoint
+try:  # Only needed for training
     import torch
     from torch import nn
     from torch.distributions.normal import Normal
@@ -50,7 +51,7 @@ CKPT = Path(__file__).parent / "race_rl.ckpt"
 # --------------------------------------------------------------------------------------------------
 # Features (numpy or jax)
 # --------------------------------------------------------------------------------------------------
-def quat_to_mat(q, xp):
+def quat_to_mat(q: Any, xp: Any) -> Any:
     """Rotation matrices (..., 3, 3) from xyzw quaternions (..., 4)."""
     x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
     n = xp.sqrt(x * x + y * y + z * z + w * w) + 1e-9
@@ -61,14 +62,14 @@ def quat_to_mat(q, xp):
     return xp.stack([r0, r1, r2], axis=-2)
 
 
-def _take(arr, idx, xp):
-    """arr (B, N, ...) gathered with idx (B,) along axis 1 -> (B, ...)."""
+def _take(arr: Any, idx: Any, xp: Any) -> Any:
+    """Gather ``arr`` (B, N, ...) gathered with idx (B,) along axis 1 -> (B, ...)."""
     idx = idx.reshape((-1,) + (1,) * (arr.ndim - 1))
     return xp.take_along_axis(arr, idx, axis=1)[:, 0]
 
 
-def features(obs: dict, last_action, xp):
-    """Policy input (B, OBS_DIM). ``obs`` holds batched env observations, ``last_action`` is (B, 4)."""
+def features(obs: dict, last_action: Any, xp: Any) -> Any:
+    """Policy input (B, OBS_DIM); ``obs`` is a batched env observation, ``last_action`` (B, 4)."""
     pos, vel, wb = obs["pos"], obs["vel"], obs["ang_vel"]
     rot = quat_to_mat(obs["quat"], xp)
     passed = obs["n_gates_passed"].astype(xp.int32)
@@ -76,7 +77,7 @@ def features(obs: dict, last_action, xp):
     k2 = xp.minimum(passed + 1, N_PASSES - 1)
     seq, dirs = obs["gate_sequence"].astype(xp.int32), obs["gate_sequence_direction"]
 
-    def gate_frame(k):
+    def gate_frame(k: Any) -> tuple[Any, Any, Any, Any, Any]:
         gid = xp.take_along_axis(seq, k[:, None], axis=1)[:, 0]
         d = xp.take_along_axis(dirs, k[:, None], axis=1)[:, 0].astype(pos.dtype)
         gp = _take(obs["gates_pos"], gid, xp)
@@ -89,7 +90,7 @@ def features(obs: dict, last_action, xp):
     gp1, ex1, ey1, ez1, vis1 = gate_frame(k1)
     gp2, ex2, _, _, vis2 = gate_frame(k2)
 
-    def local(v, ex, ey, ez):
+    def local(v: Any, ex: Any, ey: Any, ez: Any) -> Any:
         return xp.stack([xp.sum(v * ex, -1), xp.sum(v * ey, -1), xp.sum(v * ez, -1)], axis=-1)
 
     rel1 = gp1 - pos
@@ -119,7 +120,7 @@ def features(obs: dict, last_action, xp):
     return xp.concatenate(feats, axis=-1).astype(xp.float32)
 
 
-def scale_action(a, t_min: float, t_max: float, xp):
+def scale_action(a: Any, t_min: float, t_max: float, xp: Any) -> Any:
     """Network output in [-1, 1]^4 -> [roll, pitch, yaw, thrust]; yaw is always commanded to 0."""
     a = xp.clip(a, -1.0, 1.0)
     roll, pitch = a[..., 0] * RP_MAX, a[..., 1] * RP_MAX
@@ -141,7 +142,7 @@ if torch is not None:  # Training only; the controller below runs on numpy alone
     class Agent(nn.Module):
         """Actor-critic with running observation normalisation (stored in the checkpoint)."""
 
-        def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = 4, hidden: int = 128):
+        def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = 4, hidden: int = 128) -> None:
             """Create the networks."""
             super().__init__()
             self.critic = nn.Sequential(
@@ -185,7 +186,7 @@ if torch is not None:  # Training only; the controller below runs on numpy alone
 
         def get_action_and_value(
             self, x: torch.Tensor, action: torch.Tensor | None = None, deterministic: bool = False
-        ):
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             """Sample (or evaluate) an action; returns action, logprob, entropy, value."""
             xn = self.norm(x)
             mean = self.actor_mean(xn)
@@ -215,7 +216,7 @@ def load_ckpt_numpy(path: Path = CKPT) -> dict[str, NDArray]:
         pkl = next(n for n in zf.namelist() if n.endswith("data.pkl"))
         prefix = pkl[: -len("data.pkl")]
 
-        def rebuild(storage, offset, size, stride, *_):
+        def rebuild(storage: Any, offset: int, size: Any, stride: Any, *_: Any) -> NDArray:
             item = storage.itemsize
             view = np.lib.stride_tricks.as_strided(
                 storage[offset:], shape=tuple(size), strides=tuple(s * item for s in stride)
@@ -223,7 +224,7 @@ def load_ckpt_numpy(path: Path = CKPT) -> dict[str, NDArray]:
             return np.array(view)
 
         class Unpickler(pickle.Unpickler):
-            def find_class(self, module: str, name: str):
+            def find_class(self, module: str, name: str) -> Any:
                 if name == "_rebuild_tensor_v2":
                     return rebuild
                 if module == "collections" and name == "OrderedDict":
@@ -232,7 +233,7 @@ def load_ckpt_numpy(path: Path = CKPT) -> dict[str, NDArray]:
                     return np.dtype(_STORAGE_DTYPES[name])
                 raise pickle.UnpicklingError(f"unexpected object {module}.{name} in checkpoint")
 
-            def persistent_load(self, pid):
+            def persistent_load(self, pid: Any) -> NDArray:
                 _, dtype, key, _, _ = pid
                 return np.frombuffer(zf.read(f"{prefix}data/{key}"), dtype=dtype)
 
@@ -254,7 +255,7 @@ def policy(x: NDArray, w: dict[str, NDArray]) -> NDArray:
 class RaceRL(Controller):
     """Runs the trained racing policy (attitude interface)."""
 
-    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict) -> None:
         """Load the policy."""
         super().__init__(obs, info, config)
         params = load_params(config.sim.dynamics, config.sim.drone)
@@ -274,10 +275,12 @@ class RaceRL(Controller):
         self._last = a.copy()
         return scale_action(a, self._t_min, self._t_max, np)[0].astype(np.float32)
 
-    def step_callback(self, action, obs, reward, terminated, truncated, info) -> bool:
+    def step_callback(
+        self, action: Any, obs: Any, reward: Any, terminated: Any, truncated: Any, info: Any
+    ) -> bool:
         """Never finish early; the environment ends the episode after the last gate."""
         return False
 
-    def episode_callback(self):
+    def episode_callback(self) -> None:
         """Reset the action memory."""
         self._last = np.zeros((1, 4), dtype=np.float32)
