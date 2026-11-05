@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 N_GATES = 4
 N_POLES = 4
 N_PASSES = 5
-RP_MAX = 1.2  # rad, roll/pitch command at network output +-1
+RP_MAX = 1.38  # rad, roll/pitch command at network output +-1
 OBS_DIM = 59
 CKPT = Path(__file__).parent / "race_rl.ckpt"
 
